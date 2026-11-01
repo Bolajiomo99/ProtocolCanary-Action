@@ -463,6 +463,23 @@ describe("ensureCanaryInstalled", () => {
     expect(cacheMocks.restoreCacheMock).not.toHaveBeenCalled();
   });
 
+  it("reuses a pre-installed binary only when its exact published checksum verifies", async () => {
+    const candidate = cargoBinaryPath();
+    fs.chmodSync(path.dirname(candidate), 0o755);
+    fs.writeFileSync(candidate, "published binary", { mode: 0o755 });
+    fs.chmodSync(candidate, 0o755);
+    mockPublishedChecksums(`${sha256(candidate)}  ${getReleaseAssetName(candidate)}\n`);
+
+    const installed = await ensureCanaryInstalled(RESOLVED);
+
+    expect(installed, JSON.stringify(coreMocks.warningMock.mock.calls)).toEqual({
+      binaryPath: candidate,
+      version: "0.1.0",
+      origin: "release-asset",
+    });
+    expect(cargoInstallSpawned()).toBe(false);
+  });
+
   it("emits a deprecation warning for an engine strictly older than 0.1.0 (#374)", async () => {
     writeInstalledBinary();
     versionProbeResults = ["0.0.9"];
@@ -831,6 +848,43 @@ describe("ensureCanaryInstalled", () => {
     versionProbeExitCode = 1;
 
     await expect(ensureCanaryInstalled(RESOLVED)).rejects.toThrow(CanaryNotFoundError);
+  });
+
+  it("rejects a freshly installed binary that reports the wrong version", async () => {
+    versionProbeResults = ["0.2.0"];
+
+    await expect(ensureCanaryInstalled(RESOLVED)).rejects.toThrow(InstallationFailedError);
+    expect(installArgs()[0]).toBe("install");
+  });
+
+  it("fails clearly when it cannot write the installed binary's digest sidecar", async () => {
+    const sidecarPath = path.join(path.dirname(binaryPath()), "stellar-canary.sha256");
+    const originalWriteFileSync = fs.writeFileSync;
+    let failSidecarWrite = false;
+    const writeFileSyncSpy = vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+      if (failSidecarWrite && typeof file === "string" && file === sidecarPath) {
+        throw new Error("simulated disk full");
+      }
+      return originalWriteFileSync(file, data, options);
+    });
+    spawnMock.mockImplementation((command: string, args: string[] = []) =>
+      routedSpawn(command, args, {
+        install: () => {
+          fs.writeFileSync(binaryPath(), "binary", { mode: 0o755 });
+          failSidecarWrite = true;
+          return new ImmediateChild(0) as unknown as ChildProcess;
+        },
+        version: () => new ImmediateChild(0, "stellar-canary 0.1.0\n") as unknown as ChildProcess,
+      }),
+    );
+
+    try {
+      await expect(ensureCanaryInstalled(RESOLVED)).rejects.toThrow(
+        "Could not write the install-time SHA-256 sidecar",
+      );
+    } finally {
+      writeFileSyncSpy.mockRestore();
+    }
   });
 
   it("does not touch the cache at all when the cache feature is unavailable", async () => {
